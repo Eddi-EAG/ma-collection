@@ -104,17 +104,50 @@ async function api(method, url, body) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(url, opts);
+  let res;
+  try {
+    res = await fetch(url, opts);
+  } catch {
+    throw new Error("Impossible de joindre le serveur. Relance « Lancer la collection.bat » puis actualise la page.");
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `Erreur ${res.status}`);
   return data;
 }
 
+// Envoie les photos une par une (plusieurs photos de téléphone dépasseraient
+// vite la taille maximale d'un envoi). Renvoie les fichiers refusés.
 async function uploadPhotos(url, input) {
-  if (!input || !input.files.length) return;
-  const fd = new FormData();
-  [...input.files].forEach((f) => fd.append("photos", f));
-  await api("POST", url, fd);
+  const skipped = [];
+  if (!input) return skipped;
+  for (const file of input.files) {
+    const fd = new FormData();
+    fd.append("photos", file);
+    skipped.push(...(await api("POST", url, fd)).skipped);
+  }
+  return skipped;
+}
+
+function toastUpload(okMessage, skipped) {
+  if (skipped.length) toast(`Format non pris en charge (utilise JPEG, PNG ou WebP) : ${skipped.join(", ")}`, true);
+  else toast(okMessage);
+}
+
+// Enveloppe un gestionnaire d'événement : toute erreur s'affiche en notification.
+const guard = (fn) => async (...args) => {
+  try {
+    await fn(...args);
+  } catch (err) {
+    toast(err.message, true);
+  }
+};
+
+// N'accepte que des liens web ; ajoute https:// si l'adresse n'a pas de protocole.
+function safeUrl(value) {
+  const s = (value || "").trim();
+  if (!s) return "";
+  const full = /^[a-z][a-z0-9+.-]*:/i.test(s) ? s : `https://${s}`;
+  return /^https?:\/\//i.test(full) ? full : "";
 }
 
 let toastTimer;
@@ -182,7 +215,9 @@ $modal.addEventListener("click", (e) => { if (e.target === $modal) $modal.close(
 const state = { filters: { q: "", movement: "", sort: "brand" } };
 
 async function pageCollection() {
+  const token = renderId;
   const watches = await api("GET", "/api/watches");
+  if (token !== renderId) return;
   const f = state.filters;
 
   const totalPrice = watches.reduce((s, w) => s + (w.purchase_price || 0), 0);
@@ -261,7 +296,9 @@ function watchCard(w) {
 }
 
 async function pageWatch(id) {
+  const token = renderId;
   const w = await api("GET", `/api/watches/${id}`);
+  if (token !== renderId) return;
   const m = w.maintenance;
   let current = 0;
 
@@ -353,7 +390,7 @@ async function pageWatch(id) {
   };
   renderGallery();
 
-  document.getElementById("thumbs").addEventListener("click", async (e) => {
+  document.getElementById("thumbs").addEventListener("click", guard(async (e) => {
     const t = e.target.closest("[data-thumb]");
     if (t) { current = Number(t.dataset.thumb); renderGallery(); return; }
     const d = e.target.closest("[data-del-photo]");
@@ -362,39 +399,43 @@ async function pageWatch(id) {
       toast("Photo supprimée");
       render();
     }
-  });
-  document.getElementById("thumbs").addEventListener("change", async (e) => {
+  }));
+  document.getElementById("thumbs").addEventListener("change", guard(async (e) => {
     if (e.target.id !== "photo-input") return;
-    await uploadPhotos(`/api/watches/${id}/photos`, e.target);
-    toast("Photos ajoutées");
-    render();
-  });
+    try {
+      toastUpload("Photos ajoutées", await uploadPhotos(`/api/watches/${id}/photos`, e.target));
+    } finally {
+      render(); // affiche aussi les photos passées avant une éventuelle erreur
+    }
+  }));
 
-  document.getElementById("del-watch").addEventListener("click", async () => {
+  document.getElementById("del-watch").addEventListener("click", guard(async () => {
     if (!confirm(`Supprimer définitivement « ${watchName(w)} » et tout son historique ?`)) return;
     await api("DELETE", `/api/watches/${id}`);
     toast("Montre supprimée");
     location.hash = "#/";
-  });
+  }));
 
-  document.getElementById("service-form").addEventListener("submit", async (e) => {
+  document.getElementById("service-form").addEventListener("submit", guard(async (e) => {
     e.preventDefault();
     await api("POST", `/api/watches/${id}/services`, formValues(e.target));
     toast("Intervention enregistrée");
     await render();
-    document.getElementById("entretien").scrollIntoView({ block: "start" });
-  });
+    document.getElementById("entretien")?.scrollIntoView({ block: "start" });
+  }));
 
-  $app.querySelectorAll("[data-del-service]").forEach((b) => b.addEventListener("click", async () => {
+  $app.querySelectorAll("[data-del-service]").forEach((b) => b.addEventListener("click", guard(async () => {
     if (!confirm("Supprimer cette intervention ?")) return;
     await api("DELETE", `/api/services/${b.dataset.delService}`);
     toast("Intervention supprimée");
     render();
-  }));
+  })));
 }
 
 async function pageWatchForm(id) {
+  const token = renderId;
   const w = id ? await api("GET", `/api/watches/${id}`) : {};
+  if (token !== renderId) return;
   $app.innerHTML = `
     <a class="back" href="${id ? `#/montre/${id}` : "#/"}">← ${id ? esc(watchName(w)) : "La collection"}</a>
     <div class="page-head"><div><div class="eyebrow">${id ? "Modifier" : "Nouvelle entrée"}</div><h1>${id ? esc(watchName(w)) : "Ajouter une montre"}</h1></div></div>
@@ -419,20 +460,28 @@ async function pageWatchForm(id) {
     e.preventDefault();
     const data = formValues(e.target);
     try {
-      let watchId = id;
-      if (id) await api("PUT", `/api/watches/${id}`, data);
-      else {
-        watchId = (await api("POST", "/api/watches", data)).id;
-        await uploadPhotos(`/api/watches/${watchId}/photos`, document.getElementById("new-photos"));
+      if (id) {
+        await api("PUT", `/api/watches/${id}`, data);
+        toast("Fiche mise à jour");
+        location.hash = `#/montre/${id}`;
+        return;
       }
-      toast(id ? "Fiche mise à jour" : "Montre ajoutée à la collection");
+      const photoInput = document.getElementById("new-photos");
+      const watchId = (await api("POST", "/api/watches", data)).id;
+      // La montre existe désormais : on va sur sa fiche même si une photo échoue,
+      // sinon un second clic sur « Ajouter » créerait un doublon.
       location.hash = `#/montre/${watchId}`;
+      toastUpload("Montre ajoutée à la collection",
+        await uploadPhotos(`/api/watches/${watchId}/photos`, photoInput));
+      render();
     } catch (err) { toast(err.message, true); }
   });
 }
 
 async function pageMaintenance() {
+  const token = renderId;
   const items = await api("GET", "/api/maintenance");
+  if (token !== renderId) return;
   const count = (s) => items.filter((w) => w.maintenance.status === s).length;
 
   $app.innerHTML = `
@@ -468,7 +517,9 @@ async function pageMaintenance() {
 }
 
 async function pageWishlist() {
+  const token = renderId;
   const items = await api("GET", "/api/wishlist");
+  if (token !== renderId) return;
   const total = items.reduce((s, w) => s + (w.target_price || 0), 0);
 
   $app.innerHTML = `
@@ -509,7 +560,7 @@ function wishCard(w) {
       <div class="card-actions">
         <button class="btn btn-sm" data-edit-wish="${w.id}">Modifier</button>
         <button class="btn btn-sm" data-acquire="${w.id}">Je l'ai achetée</button>
-        ${w.link ? `<a class="btn btn-sm btn-ghost" href="${esc(w.link)}" target="_blank" rel="noopener">Annonce ↗</a>` : ""}
+        ${safeUrl(w.link) ? `<a class="btn btn-sm btn-ghost" href="${esc(safeUrl(w.link))}" target="_blank" rel="noopener">Annonce ↗</a>` : ""}
       </div>
     </div>`;
 }
@@ -522,7 +573,7 @@ function wishModal(w = {}) {
     { name: "priority", label: "Priorité", options: PRIORITIES, noEmpty: true },
     { name: "target_price", label: "Prix cible", type: "number", unit: "€", step: "0.01" },
     { name: "current_price", label: "Prix constaté", type: "number", unit: "€", step: "0.01" },
-    { name: "link", label: "Lien (annonce, boutique…)", type: "url", wide: true, placeholder: "https://" },
+    { name: "link", label: "Lien (annonce, boutique…)", wide: true, placeholder: "chrono24.fr/…" },
     { name: "notes", label: "Notes", type: "textarea", wide: true },
   ];
   openModal(`
@@ -547,30 +598,31 @@ function wishModal(w = {}) {
       </div>
     </form>`);
 
+  // Une photo supprimée dans la fenêtre l'est tout de suite côté serveur :
+  // on rafraîchit la page à la fermeture, même sur « Annuler ».
+  $modal.addEventListener("close", () => render(), { once: true });
+
   const form = document.getElementById("wish-form");
-  form.addEventListener("submit", async (e) => {
+  let wishId = w.id;
+  form.addEventListener("submit", guard(async (e) => {
     e.preventDefault();
-    try {
-      let wishId = w.id;
-      if (wishId) await api("PUT", `/api/wishlist/${wishId}`, formValues(form));
-      else wishId = (await api("POST", "/api/wishlist", formValues(form))).id;
-      await uploadPhotos(`/api/wishlist/${wishId}/photos`, document.getElementById("wish-photos"));
-      $modal.close();
-      toast(w.id ? "Envie mise à jour" : "Ajoutée à la wishlist");
-      render();
-    } catch (err) { toast(err.message, true); }
-  });
-  form.querySelectorAll("[data-del-photo]").forEach((b) => b.addEventListener("click", async () => {
+    // Après un premier enregistrement réussi, un nouvel essai met à jour au lieu de recréer.
+    if (wishId) await api("PUT", `/api/wishlist/${wishId}`, formValues(form));
+    else wishId = (await api("POST", "/api/wishlist", formValues(form))).id;
+    const skipped = await uploadPhotos(`/api/wishlist/${wishId}/photos`, document.getElementById("wish-photos"));
+    $modal.close();
+    toastUpload(w.id ? "Envie mise à jour" : "Ajoutée à la wishlist", skipped);
+  }));
+  form.querySelectorAll("[data-del-photo]").forEach((b) => b.addEventListener("click", guard(async () => {
     await api("DELETE", `/api/photos/${b.dataset.delPhoto}`);
     b.parentElement.remove();
-  }));
-  document.getElementById("del-wish")?.addEventListener("click", async () => {
+  })));
+  document.getElementById("del-wish")?.addEventListener("click", guard(async () => {
     if (!confirm(`Retirer « ${watchName(w)} » de la wishlist ?`)) return;
     await api("DELETE", `/api/wishlist/${w.id}`);
     $modal.close();
     toast("Retirée de la wishlist");
-    render();
-  });
+  }));
 }
 
 function acquireModal(w) {
@@ -592,13 +644,13 @@ function acquireModal(w) {
       </div></div>
     </form>`);
 
-  document.getElementById("acquire-form").addEventListener("submit", async (e) => {
+  document.getElementById("acquire-form").addEventListener("submit", guard(async (e) => {
     e.preventDefault();
     const { id } = await api("POST", `/api/wishlist/${w.id}/acquire`, formValues(e.target));
     $modal.close();
     toast("Ajoutée à la collection — complète sa fiche");
     location.hash = `#/montre/${id}/modifier`;
-  });
+  }));
 }
 
 // --- Routeur ----------------------------------------------------------------
@@ -612,21 +664,30 @@ const routes = [
   [/^#\/wishlist$/, pageWishlist, "wishlist"],
 ];
 
+// Chaque affichage reçoit un numéro : une page dont les données arrivent après
+// une navigation plus récente ne doit pas écraser la nouvelle page.
+let renderId = 0;
+
 async function render() {
+  const id = ++renderId;
   const hash = location.hash || "#/";
   const [re, page, nav] = routes.find(([r]) => r.test(hash)) || routes[0];
   document.querySelectorAll("[data-nav]").forEach((a) => a.classList.toggle("active", a.dataset.nav === nav));
   try {
     await page(hash.match(re));
   } catch (err) {
-    $app.innerHTML = `<div class="empty"><h2>Oups</h2><p>${esc(err.message)}</p><a class="btn" href="#/">Retour à la collection</a></div>`;
+    if (id !== renderId) return;
+    $app.innerHTML = `<div class="empty"><h2>Oups</h2><p>${esc(err.message)}</p>
+      <div class="btn-row" style="justify-content:center;margin-top:18px">
+        <button class="btn" onclick="render()">Réessayer</button>
+        <a class="btn btn-ghost" href="#/">Retour à la collection</a>
+      </div></div>`;
   }
 }
 
-let lastHash = location.hash;
 window.addEventListener("hashchange", () => {
+  if ($modal.open) $modal.close();
+  window.scrollTo(0, 0);
   render();
-  if (location.hash !== lastHash) window.scrollTo(0, 0);
-  lastHash = location.hash;
 });
 render();

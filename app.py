@@ -7,7 +7,10 @@ l'app est hébergée il suffit de déployer ce serveur tel quel, en changeant
 
 import os
 import sqlite3
+import sys
+import threading
 import uuid
+import webbrowser
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -18,7 +21,8 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
 DB_PATH = DATA_DIR / "montres.db"
 
-ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"}
+# Formats affichables par les navigateurs (le HEIC des iPhone ne l'est pas).
+ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
 SOON_DAYS = 180  # une révision est "à prévoir" dans les 6 mois avant l'échéance
 FULL_SERVICE = "Révision complète"
 
@@ -116,7 +120,9 @@ def clean(payload, fields):
             out[name] = None
             continue
         try:
-            out[name] = kind(value.strip() if isinstance(value, str) else value)
+            value = value.strip() if isinstance(value, str) else value
+            # "24.0" doit donner 24 pour un champ entier, pas une erreur
+            out[name] = int(float(value)) if kind is int else kind(value)
         except (TypeError, ValueError):
             abort(400, f"Valeur invalide pour « {name} »")
     return out
@@ -146,7 +152,7 @@ def update(table, row_id, data):
 def fetch_one(sql, args=()):
     row = get_db().execute(sql, args).fetchone()
     if row is None:
-        abort(404)
+        abort(404, "Élément introuvable : il a peut-être été supprimé")
     return dict(row)
 
 
@@ -163,15 +169,18 @@ def delete_photo_files(column, row_id):
 
 
 def save_uploads(column, row_id):
-    saved = []
+    """Enregistre les photos envoyées ; renvoie les ids créés et les noms des
+    fichiers refusés (format non affichable) pour que l'interface le signale."""
+    saved, skipped = [], []
     for file in request.files.getlist("photos"):
         ext = Path(file.filename or "").suffix.lower()
         if ext not in ALLOWED_IMAGE_EXT:
+            skipped.append(file.filename)
             continue
         filename = f"{uuid.uuid4().hex}{ext}"
         file.save(UPLOAD_DIR / filename)
         saved.append(insert("photos", {column: row_id, "filename": filename}))
-    return saved
+    return {"ids": saved, "skipped": skipped}
 
 
 # --- Entretien ---------------------------------------------------------------
@@ -269,7 +278,7 @@ def delete_watch(watch_id):
 @app.post("/api/watches/<int:watch_id>/photos")
 def upload_watch_photos(watch_id):
     fetch_one("SELECT id FROM watches WHERE id = ?", (watch_id,))
-    return jsonify({"ids": save_uploads("watch_id", watch_id)}), 201
+    return jsonify(save_uploads("watch_id", watch_id)), 201
 
 
 @app.delete("/api/photos/<int:photo_id>")
@@ -361,7 +370,7 @@ def delete_wish(wish_id):
 @app.post("/api/wishlist/<int:wish_id>/photos")
 def upload_wish_photos(wish_id):
     fetch_one("SELECT id FROM wishlist WHERE id = ?", (wish_id,))
-    return jsonify({"ids": save_uploads("wish_id", wish_id)}), 201
+    return jsonify(save_uploads("wish_id", wish_id)), 201
 
 
 @app.post("/api/wishlist/<int:wish_id>/acquire")
@@ -395,9 +404,11 @@ def index():
 
 @app.errorhandler(400)
 @app.errorhandler(404)
+@app.errorhandler(413)
 def json_error(err):
     if request.path.startswith("/api/"):
-        return jsonify({"error": err.description}), err.code
+        message = "Photo trop lourde (40 Mo maximum)" if err.code == 413 else err.description
+        return jsonify({"error": message}), err.code
     return err
 
 
@@ -405,5 +416,9 @@ init_db()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"Collection de montres : http://localhost:{port}")
+    url = f"http://localhost:{port}"
+    print(f"Collection de montres : {url}")
+    if "--open" in sys.argv:
+        # Ouvre le navigateur une fois le serveur démarré, pas avant.
+        threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     app.run(host=os.environ.get("HOST", "127.0.0.1"), port=port, debug=False)

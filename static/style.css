@@ -265,6 +265,7 @@ a.card:hover .card-media img { transform: scale(1.03); }
 }
 .thumb-wrap { position: relative; }
 .thumb-wrap:hover .thumb-del { display: block; }
+@media (hover: none) { .thumb-del { display: block; } } /* pas de survol au doigt */
 .add-photo {
   width: 64px;
   height: 64px;
