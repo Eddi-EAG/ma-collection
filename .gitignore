@@ -1,0 +1,3 @@
+# Données personnelles (base + photos) : à sauvegarder, pas à versionner
+data/
+__pycache__/
