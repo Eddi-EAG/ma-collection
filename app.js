@@ -1,5 +1,7 @@
 // Collection de montres — interface (sans framework, sans étape de build).
-// Toutes les données passent par l'API /api du serveur.
+// Les données sont stockées sur l'appareil via store.js : l'app marche hors ligne.
+
+import { Store, localIsoDate } from "./store.js";
 
 const $app = document.getElementById("app");
 const $modal = document.getElementById("modal");
@@ -22,6 +24,7 @@ const STATUS_LABELS = {
   ok: "Entretien à jour",
   unknown: "Entretien non renseigné",
 };
+const BACKUP_REMINDER_DAYS = 30;
 
 // Sections de la fiche montre : servent à la fois au formulaire et à l'affichage.
 const WATCH_SECTIONS = [
@@ -81,11 +84,8 @@ const fmtMoney = (v) => (v == null ? "—" : euro.format(v));
 const fmtNum = (v) => new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 2 }).format(v);
 const fmtDate = (iso, opts = { day: "numeric", month: "long", year: "numeric" }) =>
   iso ? new Date(iso.slice(0, 10) + "T12:00:00").toLocaleDateString("fr-FR", opts) : "—";
-const today = () => {
-  const d = new Date();
-  d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); // date locale, pas UTC
-  return d.toISOString().slice(0, 10);
-};
+const today = () => localIsoDate();
+const daysSince = (iso) => Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
 
 function fmtRelative(days) {
   const rtf = new Intl.RelativeTimeFormat("fr", { numeric: "auto" });
@@ -97,39 +97,11 @@ function fmtRelative(days) {
 
 const watchName = (w) => [w.brand, w.model].filter(Boolean).join(" ") || "Sans nom";
 
-async function api(method, url, body) {
-  const opts = { method, headers: {} };
-  if (body instanceof FormData) opts.body = body;
-  else if (body !== undefined) {
-    opts.headers["Content-Type"] = "application/json";
-    opts.body = JSON.stringify(body);
-  }
-  let res;
-  try {
-    res = await fetch(url, opts);
-  } catch {
-    throw new Error("Impossible de joindre le serveur. Relance « Lancer la collection.bat » puis actualise la page.");
-  }
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Erreur ${res.status}`);
-  return data;
-}
-
-// Envoie les photos une par une (plusieurs photos de téléphone dépasseraient
-// vite la taille maximale d'un envoi). Renvoie les fichiers refusés.
-async function uploadPhotos(url, input) {
-  const skipped = [];
-  if (!input) return skipped;
-  for (const file of input.files) {
-    const fd = new FormData();
-    fd.append("photos", file);
-    skipped.push(...(await api("POST", url, fd)).skipped);
-  }
-  return skipped;
-}
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const isInstalled = () => matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
 
 function toastUpload(okMessage, skipped) {
-  if (skipped.length) toast(`Format non pris en charge (utilise JPEG, PNG ou WebP) : ${skipped.join(", ")}`, true);
+  if (skipped.length) toast(`Format d'image non lisible : ${skipped.join(", ")}`, true);
   else toast(okMessage);
 }
 
@@ -155,7 +127,7 @@ function toast(message, isError = false) {
   $toast.textContent = message;
   $toast.className = `toast show${isError ? " error" : ""}`;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => ($toast.className = "toast"), 2600);
+  toastTimer = setTimeout(() => ($toast.className = "toast"), isError ? 4500 : 2600);
 }
 
 function formValues(form) {
@@ -184,7 +156,8 @@ function fieldHtml(f, value) {
   }
   const listId = f.list ? `list-${f.name}` : "";
   const datalist = f.list ? `<datalist id="${listId}">${f.list.map((o) => `<option value="${esc(o)}">`).join("")}</datalist>` : "";
-  const input = `<input id="${id}" name="${f.name}" type="${f.type || "text"}" value="${esc(v)}"
+  const numeric = f.type === "number" ? `inputmode="decimal"` : "";
+  const input = `<input id="${id}" name="${f.name}" type="${f.type || "text"}" value="${esc(v)}" ${numeric}
     ${f.step ? `step="${f.step}"` : f.type === "number" ? 'step="any"' : ""} ${f.list ? `list="${listId}"` : ""}
     ${f.required ? "required" : ""} placeholder="${esc(f.placeholder)}">`;
   const body = f.unit ? `<div class="unit-wrap">${input}<span class="unit">${f.unit}</span></div>` : input;
@@ -210,13 +183,31 @@ function openModal(html) {
 
 $modal.addEventListener("click", (e) => { if (e.target === $modal) $modal.close(); });
 
+// Bandeaux d'aide affichés en haut de la collection.
+async function noticesHtml(hasWatches) {
+  const notices = [];
+  if (isIOS && !isInstalled()) {
+    notices.push(`<strong>Installe l'app sur ton iPhone</strong> pour qu'elle marche hors ligne et que tes données soient bien conservées :
+      dans Safari, touche <em>Partager</em> puis <em>Sur l'écran d'accueil</em>.`);
+  }
+  if (hasWatches) {
+    const last = await Store.getMeta("last_backup");
+    if (!last || daysSince(last) > BACKUP_REMINDER_DAYS) {
+      notices.push(`${last ? `Dernière sauvegarde ${fmtRelative(-daysSince(last))}.` : "Ta collection n'a jamais été sauvegardée."}
+        Tes données ne sont que sur cet appareil : <a href="#/sauvegarde">fais une sauvegarde</a>.`);
+    }
+  }
+  return notices.map((n) => `<div class="notice">${n}</div>`).join("");
+}
+
 // --- Pages ------------------------------------------------------------------
 
 const state = { filters: { q: "", movement: "", sort: "brand" } };
 
 async function pageCollection() {
   const token = renderId;
-  const watches = await api("GET", "/api/watches");
+  const watches = await Store.listWatches();
+  const notices = await noticesHtml(watches.length > 0);
   if (token !== renderId) return;
   const f = state.filters;
 
@@ -226,6 +217,7 @@ async function pageCollection() {
   const toService = watches.filter((w) => ["soon", "overdue"].includes(w.maintenance.status)).length;
 
   $app.innerHTML = `
+    ${notices}
     <div class="page-head">
       <div><div class="eyebrow">Registre</div><h1>La collection</h1></div>
       <a class="btn btn-primary" href="#/montre/nouvelle">+ Ajouter une montre</a>
@@ -254,7 +246,10 @@ async function pageCollection() {
     <div class="empty">
       <h2>Le coffre est vide</h2>
       <p>Ajoute ta première montre pour commencer ton registre.</p>
-      <a class="btn btn-primary" href="#/montre/nouvelle">+ Ajouter une montre</a>
+      <div class="btn-row" style="justify-content:center;margin-top:18px">
+        <a class="btn btn-primary" href="#/montre/nouvelle">+ Ajouter une montre</a>
+        <a class="btn btn-ghost" href="#/sauvegarde">Restaurer une sauvegarde</a>
+      </div>
     </div>`}`;
 
   if (!watches.length) return;
@@ -297,7 +292,7 @@ function watchCard(w) {
 
 async function pageWatch(id) {
   const token = renderId;
-  const w = await api("GET", `/api/watches/${id}`);
+  const w = await Store.getWatch(id);
   if (token !== renderId) return;
   const m = w.maintenance;
   let current = 0;
@@ -383,7 +378,7 @@ async function pageWatch(id) {
     main.innerHTML = p ? `<img src="${p.url}" alt="${esc(watchName(w))}">` : WATCH_ICON;
     document.getElementById("thumbs").innerHTML = w.photos.map((ph, i) => `
       <div class="thumb-wrap">
-        <button class="thumb ${i === current ? "active" : ""}" data-thumb="${i}" title="Voir"><img src="${ph.url}" alt=""></button>
+        <button class="thumb ${i === current ? "active" : ""}" data-thumb="${i}" title="Voir"><img src="${ph.thumb}" alt=""></button>
         <button class="thumb-del" data-del-photo="${ph.id}" title="Supprimer la photo">×</button>
       </div>`).join("") + `
       <label class="add-photo" title="Ajouter des photos">+<input type="file" id="photo-input" accept="image/*" multiple hidden></label>`;
@@ -395,30 +390,28 @@ async function pageWatch(id) {
     if (t) { current = Number(t.dataset.thumb); renderGallery(); return; }
     const d = e.target.closest("[data-del-photo]");
     if (d && confirm("Supprimer cette photo ?")) {
-      await api("DELETE", `/api/photos/${d.dataset.delPhoto}`);
+      await Store.deletePhoto(d.dataset.delPhoto);
       toast("Photo supprimée");
       render();
     }
   }));
   document.getElementById("thumbs").addEventListener("change", guard(async (e) => {
     if (e.target.id !== "photo-input") return;
-    try {
-      toastUpload("Photos ajoutées", await uploadPhotos(`/api/watches/${id}/photos`, e.target));
-    } finally {
-      render(); // affiche aussi les photos passées avant une éventuelle erreur
-    }
+    toast("Ajout des photos…");
+    toastUpload("Photos ajoutées", await Store.addPhotos({ watch_id: id }, e.target.files));
+    render();
   }));
 
   document.getElementById("del-watch").addEventListener("click", guard(async () => {
     if (!confirm(`Supprimer définitivement « ${watchName(w)} » et tout son historique ?`)) return;
-    await api("DELETE", `/api/watches/${id}`);
+    await Store.deleteWatch(id);
     toast("Montre supprimée");
     location.hash = "#/";
   }));
 
   document.getElementById("service-form").addEventListener("submit", guard(async (e) => {
     e.preventDefault();
-    await api("POST", `/api/watches/${id}/services`, formValues(e.target));
+    await Store.createService(id, formValues(e.target));
     toast("Intervention enregistrée");
     await render();
     document.getElementById("entretien")?.scrollIntoView({ block: "start" });
@@ -426,7 +419,7 @@ async function pageWatch(id) {
 
   $app.querySelectorAll("[data-del-service]").forEach((b) => b.addEventListener("click", guard(async () => {
     if (!confirm("Supprimer cette intervention ?")) return;
-    await api("DELETE", `/api/services/${b.dataset.delService}`);
+    await Store.deleteService(b.dataset.delService);
     toast("Intervention supprimée");
     render();
   })));
@@ -434,7 +427,7 @@ async function pageWatch(id) {
 
 async function pageWatchForm(id) {
   const token = renderId;
-  const w = id ? await api("GET", `/api/watches/${id}`) : {};
+  const w = id ? await Store.getWatch(id) : {};
   if (token !== renderId) return;
   $app.innerHTML = `
     <a class="back" href="${id ? `#/montre/${id}` : "#/"}">← ${id ? esc(watchName(w)) : "La collection"}</a>
@@ -448,7 +441,7 @@ async function pageWatchForm(id) {
       ${id ? "" : `
         <section class="form-section">
           <h2 class="section-title">Photos</h2>
-          <div class="form-grid"><div class="field wide"><input type="file" id="new-photos" accept="image/*" multiple style="height:auto;padding:10px"></div></div>
+          <div class="form-grid"><div class="field wide"><input type="file" id="new-photos" accept="image/*" multiple class="file-input"></div></div>
         </section>`}
       <div class="form-actions">
         <a class="btn btn-ghost" href="${id ? `#/montre/${id}` : "#/"}">Annuler</a>
@@ -456,31 +449,29 @@ async function pageWatchForm(id) {
       </div>
     </form>`;
 
-  document.getElementById("watch-form").addEventListener("submit", async (e) => {
+  document.getElementById("watch-form").addEventListener("submit", guard(async (e) => {
     e.preventDefault();
     const data = formValues(e.target);
-    try {
-      if (id) {
-        await api("PUT", `/api/watches/${id}`, data);
-        toast("Fiche mise à jour");
-        location.hash = `#/montre/${id}`;
-        return;
-      }
-      const photoInput = document.getElementById("new-photos");
-      const watchId = (await api("POST", "/api/watches", data)).id;
-      // La montre existe désormais : on va sur sa fiche même si une photo échoue,
-      // sinon un second clic sur « Ajouter » créerait un doublon.
-      location.hash = `#/montre/${watchId}`;
-      toastUpload("Montre ajoutée à la collection",
-        await uploadPhotos(`/api/watches/${watchId}/photos`, photoInput));
-      render();
-    } catch (err) { toast(err.message, true); }
-  });
+    if (id) {
+      await Store.updateWatch(id, data);
+      toast("Fiche mise à jour");
+      location.hash = `#/montre/${id}`;
+      return;
+    }
+    const files = document.getElementById("new-photos").files;
+    const watchId = await Store.createWatch(data);
+    // La montre existe désormais : on va sur sa fiche même si une photo échoue,
+    // sinon un second appui sur « Ajouter » créerait un doublon.
+    location.hash = `#/montre/${watchId}`;
+    if (files.length) toast("Ajout des photos…");
+    toastUpload("Montre ajoutée à la collection", await Store.addPhotos({ watch_id: watchId }, files));
+    render();
+  }));
 }
 
 async function pageMaintenance() {
   const token = renderId;
-  const items = await api("GET", "/api/maintenance");
+  const items = await Store.maintenanceOverview();
   if (token !== renderId) return;
   const count = (s) => items.filter((w) => w.maintenance.status === s).length;
 
@@ -497,7 +488,7 @@ async function pageMaintenance() {
       <div class="stat"><div class="stat-value">${count("unknown")}</div><div class="stat-label">Non renseignées</div></div>
     </div>
     <div class="table-wrap"><table class="table">
-      <thead><tr><th>Montre</th><th class="hide-sm">Dernière intervention</th><th>Prochaine révision</th><th>Statut</th></tr></thead>
+      <thead><tr><th>Montre</th><th class="hide-sm">Dernière intervention</th><th>Prochaine révision</th><th class="hide-sm">Statut</th></tr></thead>
       <tbody>
         ${items.map((w) => `
           <tr class="clickable" data-href="#/montre/${w.id}">
@@ -506,8 +497,9 @@ async function pageMaintenance() {
               <div><div class="card-brand">${esc(w.brand || "—")}</div><div>${esc(w.model || "")}</div></div>
             </div></td>
             <td class="hide-sm">${w.last_service ? `${esc(w.last_service.type)}<div class="muted" style="font-size:13px">${fmtDate(w.last_service.date)}</div>` : `<span class="muted">—</span>`}</td>
-            <td>${w.maintenance.next_due ? `${fmtDate(w.maintenance.next_due, { month: "long", year: "numeric" })}<div class="muted" style="font-size:13px">${fmtRelative(w.maintenance.days_left)}</div>` : `<span class="muted">—</span>`}</td>
-            <td><span class="badge ${w.maintenance.status}">${STATUS_LABELS[w.maintenance.status]}</span></td>
+            <td>${w.maintenance.next_due ? `${fmtDate(w.maintenance.next_due, { month: "short", year: "numeric" })}<div class="muted" style="font-size:13px">${fmtRelative(w.maintenance.days_left)}</div>` : `<span class="muted">—</span>`}
+              <div class="show-sm"><span class="badge ${w.maintenance.status}">${STATUS_LABELS[w.maintenance.status]}</span></div></td>
+            <td class="hide-sm"><span class="badge ${w.maintenance.status}">${STATUS_LABELS[w.maintenance.status]}</span></td>
           </tr>`).join("")}
       </tbody>
     </table></div>` : `
@@ -518,7 +510,7 @@ async function pageMaintenance() {
 
 async function pageWishlist() {
   const token = renderId;
-  const items = await api("GET", "/api/wishlist");
+  const items = await Store.listWishlist();
   if (token !== renderId) return;
   const total = items.reduce((s, w) => s + (w.target_price || 0), 0);
 
@@ -540,6 +532,7 @@ async function pageWishlist() {
 
 function wishCard(w) {
   const inBudget = w.current_price != null && w.target_price != null && w.current_price <= w.target_price;
+  const link = safeUrl(w.link);
   return `
     <div class="card">
       <div class="card-media">
@@ -560,7 +553,7 @@ function wishCard(w) {
       <div class="card-actions">
         <button class="btn btn-sm" data-edit-wish="${w.id}">Modifier</button>
         <button class="btn btn-sm" data-acquire="${w.id}">Je l'ai achetée</button>
-        ${safeUrl(w.link) ? `<a class="btn btn-sm btn-ghost" href="${esc(safeUrl(w.link))}" target="_blank" rel="noopener">Annonce ↗</a>` : ""}
+        ${link ? `<a class="btn btn-sm btn-ghost" href="${esc(link)}" target="_blank" rel="noopener">Annonce ↗</a>` : ""}
       </div>
     </div>`;
 }
@@ -584,9 +577,9 @@ function wishModal(w = {}) {
         ${fields.map((f) => fieldHtml(f, w[f.name] ?? (f.name === "priority" ? 2 : ""))).join("")}
         <div class="field wide"><label>Photos</label>
           ${w.photos?.length ? `<div class="thumbs" style="margin:0 0 8px">${w.photos.map((p) => `
-            <div class="thumb-wrap"><span class="thumb"><img src="${p.url}" alt=""></span>
+            <div class="thumb-wrap"><span class="thumb"><img src="${p.thumb}" alt=""></span>
             <button type="button" class="thumb-del" style="display:block" data-del-photo="${p.id}" title="Supprimer">×</button></div>`).join("")}</div>` : ""}
-          <input type="file" id="wish-photos" accept="image/*" multiple style="height:auto;padding:10px">
+          <input type="file" id="wish-photos" accept="image/*" multiple class="file-input">
         </div>
       </div>
       <div class="modal-actions">
@@ -598,7 +591,7 @@ function wishModal(w = {}) {
       </div>
     </form>`);
 
-  // Une photo supprimée dans la fenêtre l'est tout de suite côté serveur :
+  // Une photo supprimée dans la fenêtre l'est tout de suite :
   // on rafraîchit la page à la fermeture, même sur « Annuler ».
   $modal.addEventListener("close", () => render(), { once: true });
 
@@ -607,19 +600,19 @@ function wishModal(w = {}) {
   form.addEventListener("submit", guard(async (e) => {
     e.preventDefault();
     // Après un premier enregistrement réussi, un nouvel essai met à jour au lieu de recréer.
-    if (wishId) await api("PUT", `/api/wishlist/${wishId}`, formValues(form));
-    else wishId = (await api("POST", "/api/wishlist", formValues(form))).id;
-    const skipped = await uploadPhotos(`/api/wishlist/${wishId}/photos`, document.getElementById("wish-photos"));
+    if (wishId) await Store.updateWish(wishId, formValues(form));
+    else wishId = await Store.createWish(formValues(form));
+    const skipped = await Store.addPhotos({ wish_id: wishId }, document.getElementById("wish-photos").files);
     $modal.close();
     toastUpload(w.id ? "Envie mise à jour" : "Ajoutée à la wishlist", skipped);
   }));
   form.querySelectorAll("[data-del-photo]").forEach((b) => b.addEventListener("click", guard(async () => {
-    await api("DELETE", `/api/photos/${b.dataset.delPhoto}`);
+    await Store.deletePhoto(b.dataset.delPhoto);
     b.parentElement.remove();
   })));
   document.getElementById("del-wish")?.addEventListener("click", guard(async () => {
     if (!confirm(`Retirer « ${watchName(w)} » de la wishlist ?`)) return;
-    await api("DELETE", `/api/wishlist/${w.id}`);
+    await Store.deleteWish(w.id);
     $modal.close();
     toast("Retirée de la wishlist");
   }));
@@ -646,10 +639,112 @@ function acquireModal(w) {
 
   document.getElementById("acquire-form").addEventListener("submit", guard(async (e) => {
     e.preventDefault();
-    const { id } = await api("POST", `/api/wishlist/${w.id}/acquire`, formValues(e.target));
+    const id = await Store.acquireWish(w.id, formValues(e.target));
     $modal.close();
     toast("Ajoutée à la collection — complète sa fiche");
     location.hash = `#/montre/${id}/modifier`;
+  }));
+}
+
+// Donne le fichier à l'utilisateur : feuille de partage sur téléphone
+// (« Enregistrer dans Fichiers », Drive…), téléchargement classique sinon.
+async function deliverFile(file) {
+  const touch = matchMedia("(pointer: coarse)").matches;
+  if (touch && navigator.canShare?.({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: file.name });
+      return true;
+    } catch (err) {
+      if (err.name === "AbortError") return false; // partage annulé
+    }
+  }
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(file);
+  a.download = file.name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  return true;
+}
+
+async function pageBackup() {
+  const token = renderId;
+  const [counts, last, persisted, estimate] = await Promise.all([
+    Store.counts(),
+    Store.getMeta("last_backup"),
+    navigator.storage?.persisted?.().catch(() => false) ?? false,
+    navigator.storage?.estimate?.().catch(() => null) ?? null,
+  ]);
+  if (token !== renderId) return;
+  const used = estimate?.usage != null ? `${fmtNum(estimate.usage / 1024 / 1024)} Mo` : "—";
+
+  $app.innerHTML = `
+    <div class="page-head">
+      <div><div class="eyebrow">Données</div><h1>Sauvegarde</h1>
+      <p class="lede">Ta collection est enregistrée uniquement sur cet appareil. Une sauvegarde régulière te protège
+      d'une perte ou d'un changement de téléphone, et permet de passer la collection sur un autre appareil.</p></div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="stat-value">${counts.watches}</div><div class="stat-label">Montre${counts.watches > 1 ? "s" : ""}</div></div>
+      <div class="stat"><div class="stat-value">${counts.wishlist}</div><div class="stat-label">Envie${counts.wishlist > 1 ? "s" : ""}</div></div>
+      <div class="stat"><div class="stat-value">${counts.photos}</div><div class="stat-label">Photo${counts.photos > 1 ? "s" : ""}</div></div>
+      <div class="stat"><div class="stat-value">${used}</div><div class="stat-label">Espace utilisé</div></div>
+    </div>
+
+    <section class="panel">
+      <h2>Sauvegarder ma collection</h2>
+      <p class="muted">Crée un fichier unique avec toutes tes fiches, l'entretien, la wishlist et les photos.
+      Sur iPhone, choisis <em>Enregistrer dans Fichiers</em> (iCloud Drive) pour le garder à l'abri.</p>
+      <p class="muted">Dernière sauvegarde : <strong style="color:var(--ink)">${last ? `${fmtDate(last)} (${fmtRelative(-daysSince(last))})` : "jamais"}</strong></p>
+      <div class="btn-row" id="export-zone"><button class="btn btn-primary" id="export">Préparer la sauvegarde</button></div>
+    </section>
+
+    <section class="panel">
+      <h2>Restaurer une sauvegarde</h2>
+      <p class="muted">Remplace <strong>toute</strong> la collection de cet appareil par le contenu du fichier choisi.</p>
+      <label class="btn">Choisir un fichier…<input type="file" id="import" accept=".json,application/json" hidden></label>
+    </section>
+
+    <section class="panel">
+      <h2>Sur cet appareil</h2>
+      <dl class="specs single">
+        <div class="spec"><dt>App installée</dt><dd>${isInstalled() ? "Oui" : "Non"}</dd></div>
+        <div class="spec"><dt>Stockage protégé</dt><dd>${persisted ? "Oui" : "Non"}</dd></div>
+        <div class="spec"><dt>Interventions enregistrées</dt><dd>${counts.services}</dd></div>
+      </dl>
+      ${isInstalled() ? "" : `<p class="muted">${isIOS
+        ? "Sur iPhone : dans Safari, touche <em>Partager</em> puis <em>Sur l'écran d'accueil</em>. L'app s'ouvrira alors en plein écran et marchera hors ligne."
+        : "Sur Android (Chrome) : menu <em>⋮</em> puis <em>Installer l'application</em>. Sur ordinateur : l'icône d'installation dans la barre d'adresse."}</p>`}
+    </section>`;
+
+  document.getElementById("export").addEventListener("click", guard(async (e) => {
+    e.target.disabled = true;
+    e.target.textContent = "Préparation…";
+    const blob = await Store.exportBackup();
+    const file = new File([blob], `ma-collection-${today()}.json`, { type: "application/json" });
+    // Le partage doit partir d'un appui direct : on propose donc un second bouton une fois le fichier prêt.
+    const zone = document.getElementById("export-zone");
+    zone.innerHTML = `<button class="btn btn-primary" id="save-file">Enregistrer le fichier (${fmtNum(blob.size / 1024 / 1024)} Mo)</button>`;
+    document.getElementById("save-file").addEventListener("click", guard(async () => {
+      if (!(await deliverFile(file))) return;
+      await Store.setMeta("last_backup", new Date().toISOString());
+      toast("Sauvegarde créée");
+      render();
+    }));
+  }));
+
+  document.getElementById("import").addEventListener("change", guard(async (e) => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    if (counts.watches + counts.wishlist > 0 &&
+        !confirm("Remplacer toute la collection de cet appareil par cette sauvegarde ?")) return;
+    toast("Restauration…");
+    const r = await Store.importBackup(file);
+    toast(`Restauré : ${r.watches} montre${r.watches > 1 ? "s" : ""}, ${r.wishlist} envie${r.wishlist > 1 ? "s" : ""}, ${r.photos} photo${r.photos > 1 ? "s" : ""}`);
+    location.hash = "#/";
   }));
 }
 
@@ -662,6 +757,7 @@ const routes = [
   [/^#\/montre\/(\d+)$/, (m) => pageWatch(m[1]), "collection"],
   [/^#\/entretien$/, pageMaintenance, "entretien"],
   [/^#\/wishlist$/, pageWishlist, "wishlist"],
+  [/^#\/sauvegarde$/, pageBackup, "sauvegarde"],
 ];
 
 // Chaque affichage reçoit un numéro : une page dont les données arrivent après
@@ -679,9 +775,10 @@ async function render() {
     if (id !== renderId) return;
     $app.innerHTML = `<div class="empty"><h2>Oups</h2><p>${esc(err.message)}</p>
       <div class="btn-row" style="justify-content:center;margin-top:18px">
-        <button class="btn" onclick="render()">Réessayer</button>
+        <button class="btn" id="retry">Réessayer</button>
         <a class="btn btn-ghost" href="#/">Retour à la collection</a>
       </div></div>`;
+    document.getElementById("retry").addEventListener("click", render);
   }
 }
 
@@ -691,3 +788,10 @@ window.addEventListener("hashchange", () => {
   render();
 });
 render();
+
+// Demande au navigateur de ne pas effacer les données en cas de manque de place.
+navigator.storage?.persist?.().catch(() => {});
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+}

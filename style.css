@@ -85,6 +85,7 @@ h1, h2, .stat-value, .card-title, .service-due-date, .prices strong { font-varia
 }
 .main-nav a:hover { color: var(--ink); }
 .main-nav a.active { color: var(--ink); border-bottom-color: var(--accent); }
+.main-nav svg { display: none; } /* icônes réservées à la barre d'onglets mobile */
 
 .page { max-width: 1180px; margin: 0 auto; padding: 32px 24px 80px; }
 
@@ -154,7 +155,7 @@ h1, h2, .stat-value, .card-title, .service-due-date, .prices strong { font-varia
   color: var(--muted);
 }
 .empty h2 { color: var(--ink); font-size: 26px; margin-bottom: 8px; }
-.empty .btn { margin-top: 18px; }
+.empty > .btn { margin-top: 18px; }
 
 .muted { color: var(--muted); }
 
@@ -423,6 +424,8 @@ input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent);
 .modal {
   width: min(640px, calc(100vw - 32px));
   max-height: calc(100vh - 48px);
+  max-height: calc(100dvh - 48px);
+  overflow-y: auto;
   border: 1px solid var(--line);
   border-radius: 6px;
   padding: 0;
@@ -455,6 +458,34 @@ input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent);
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .toast.error { background: var(--danger); color: #fff; }
 
+/* --- Bandeaux, panneaux, fichiers ---------------------------------------- */
+
+.notice {
+  margin-bottom: 16px;
+  padding: 12px 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  font-size: 14px;
+}
+.notice a { color: var(--accent); }
+
+.panel {
+  margin-bottom: 20px;
+  padding: 20px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.panel h2 { font-size: 24px; margin-bottom: 8px; }
+.panel p { margin: 0 0 14px; }
+.specs.single { grid-template-columns: 1fr; margin-bottom: 12px; }
+
+.file-input { height: auto; padding: 10px; }
+
+.show-sm { display: none; }
+
 /* --- Responsive ---------------------------------------------------------- */
 
 @media (max-width: 900px) {
@@ -463,9 +494,56 @@ input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent);
 }
 
 @media (max-width: 600px) {
-  .site-header { padding: 20px 16px 14px; }
-  .main-nav { gap: 18px; }
-  .page { padding: 24px 16px 64px; }
+  :root { --tabbar-h: calc(58px + env(safe-area-inset-bottom)); }
+  .site-header { padding: 16px 16px 12px; padding-top: max(16px, env(safe-area-inset-top)); }
+  .wordmark-title { font-size: 26px; }
+
+  /* Navigation en barre d'onglets fixée en bas, comme une app */
+  .main-nav {
+    position: fixed;
+    z-index: 5;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    gap: 0;
+    height: var(--tabbar-h);
+    padding-bottom: env(safe-area-inset-bottom);
+    background: var(--surface);
+    border-top: 1px solid var(--line);
+  }
+  .main-nav a {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    padding: 0;
+    border: 0;
+    font-size: 10px;
+    letter-spacing: .06em;
+  }
+  .main-nav a.active { color: var(--accent); }
+  .main-nav svg {
+    display: block;
+    width: 22px;
+    height: 22px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.6;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .page { padding: 20px 16px calc(var(--tabbar-h) + 32px); }
+  .form-actions { bottom: var(--tabbar-h); }
+  .toast { bottom: calc(var(--tabbar-h) + 12px); max-width: calc(100vw - 32px); }
+
+  /* Sous 16px, Safari zoome sur le champ touché */
+  input, select, textarea { font-size: 16px; }
+
+  .show-sm { display: block; margin-top: 4px; }
+  .page-head .btn-primary { width: 100%; }
   .page-head h1 { font-size: 32px; }
   .detail-title h1 { font-size: 36px; }
   .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px 14px; }
